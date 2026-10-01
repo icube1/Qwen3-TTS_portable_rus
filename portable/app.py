@@ -617,44 +617,86 @@ def sanitize_text_for_speech(text: str) -> str:
     return text.strip()
 
 
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])(?:\s+|(?=\n))")
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[;—–])\s+")
+_COMMA_SPLIT_RE = re.compile(r"(?<=[,:])\s+")
+
+
+def _hard_wrap_words(text: str, max_chars: int) -> List[str]:
+    words = text.split()
+    out: List[str] = []
+    current = ""
+    for word in words:
+        if current and len(current) + 1 + len(word) > max_chars:
+            out.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip() if current else word
+    if current:
+        out.append(current)
+    return out or [text[:max_chars]]
+
+
+def _split_long_sentence(sentence: str, max_chars: int) -> List[str]:
+    for splitter in (_CLAUSE_SPLIT_RE, _COMMA_SPLIT_RE):
+        parts = [p.strip() for p in splitter.split(sentence) if p.strip()]
+        if len(parts) <= 1:
+            continue
+        out: List[str] = []
+        current = ""
+        for part in parts:
+            if current and len(current) + 1 + len(part) > max_chars:
+                out.append(current)
+                current = part
+            else:
+                current = f"{current} {part}".strip() if current else part
+        if current:
+            out.append(current)
+        flat: List[str] = []
+        for item in out:
+            if len(item) <= max_chars:
+                flat.append(item)
+            else:
+                flat.extend(_hard_wrap_words(item, max_chars))
+        return flat
+    return _hard_wrap_words(sentence, max_chars)
+
+
 def split_text_into_chunks(text: str, max_chars: int = 1500) -> List[str]:
-    """Разбивает длинный текст на части по границам предложений."""
+    """Режет по абзацам и предложениям. Запятая — только если фраза длиннее лимита."""
     text = sanitize_text_for_speech(text.strip())
     if not text:
         return []
     if len(text) <= max_chars:
         return [text]
 
-    # Разбиваем по концам предложений (. ! ? …)
-    sentences = re.split(r'(?<=[.!?…])\s+', text)
+    sentences: List[str] = []
+    for para in re.split(r"\n{2,}", text):
+        para = para.strip()
+        if not para:
+            continue
+        sentences.extend(p.strip() for p in _SENT_SPLIT_RE.split(para) if p.strip())
 
-    chunks = []
+    chunks: List[str] = []
     current = ""
     for sentence in sentences:
-        # Если предложение само длиннее лимита — режем по запятым
-        if len(sentence) > max_chars:
-            if current:
+        pieces = [sentence] if len(sentence) <= max_chars else _split_long_sentence(sentence, max_chars)
+        for piece in pieces:
+            if not current:
+                current = piece
+            elif len(current) + 1 + len(piece) <= max_chars:
+                current = f"{current} {piece}"
+            else:
                 chunks.append(current)
-                current = ""
-            parts = re.split(r'(?<=[,;:])\s+', sentence)
-            sub = ""
-            for part in parts:
-                if len(sub) + len(part) + 1 <= max_chars:
-                    sub = (sub + " " + part).strip() if sub else part
-                else:
-                    if sub:
-                        chunks.append(sub)
-                    sub = part
-            if sub:
-                current = sub
-        elif len(current) + len(sentence) + 1 <= max_chars:
-            current = (current + " " + sentence).strip() if current else sentence
-        else:
-            if current:
-                chunks.append(current)
-            current = sentence
+                current = piece
     if current:
         chunks.append(current)
+
+    # Короткий хвост («вот и всё.») звучит как перескок — приклеиваем.
+    # Не склеиваем обратно половины длинного предложения.
+    if len(chunks) >= 2 and len(chunks[-1]) < 48 and chunks[-1].count(" ") <= 6:
+        chunks[-2] = f"{chunks[-2]} {chunks[-1]}".strip()
+        chunks.pop()
     return chunks
 
 def get_device():

@@ -82,10 +82,22 @@ def _as_pcm(chunk) -> np.ndarray:
     return pcm
 
 
-def _token_budget(text: str, requested: int) -> int:
-    """Не даём модели молотить до 2048 токенов на коротком куске — отсюда лишние слова."""
-    n = max(96, int(len(text or "") * 2.2) + 96)
-    return max(64, min(int(requested), n))
+# Qwen3-TTS 12Hz: 1 codec-токен ≈ 1/12 с. Русская речь обычно 8–14 символов/с.
+_CODEC_HZ = 12.0
+_SLOW_CHARS_PER_SEC = 6.5
+_MIN_EOS_SEC = 3.5  # только отсекает мгновенный EOS, не дотягивает чанк тишиной
+
+
+def _speech_token_limits(text: str, requested: int) -> Tuple[int, int]:
+    """min — короткий пол от раннего EOS; max — потолок, чтобы не молотить лишнее."""
+    n_chars = max(1, len((text or "").strip()))
+    min_new = max(16, min(int(_MIN_EOS_SEC * _CODEC_HZ), int(n_chars * 0.18)))
+    max_new = max(min_new + 48, int(n_chars / _SLOW_CHARS_PER_SEC * _CODEC_HZ) + 96)
+    requested = max(64, int(requested))
+    max_new = min(requested, max_new) if requested >= min_new else requested
+    if max_new < min_new:
+        min_new = max(12, int(max_new * 0.75))
+    return min_new, max_new
 
 
 def _iter_fast_stream(gen) -> Iterator[Tuple[np.ndarray, int]]:
@@ -137,16 +149,18 @@ class TtsBackend:
         top_p: float = 0.9,
         chunk_size: int = 8,
     ) -> Iterator[Tuple[np.ndarray, int]]:
-        max_new_tokens = _token_budget(text, max_new_tokens)
+        min_new, max_new_tokens = _speech_token_limits(text, max_new_tokens)
         if self.is_fast and hasattr(self.model, "generate_voice_clone_streaming"):
             kwargs = dict(
                 text=text,
                 language=language,
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new,
                 temperature=temperature,
                 top_p=top_p,
                 chunk_size=chunk_size,
                 repetition_penalty=1.12,
+                non_streaming_mode=True,
             )
             if voice_clone_prompt is not None:
                 kwargs["voice_clone_prompt"] = voice_clone_prompt
@@ -164,9 +178,11 @@ class TtsBackend:
         kwargs = dict(
             text=text,
             language=language,
-            max_new_tokens=_token_budget(text, max_new_tokens),
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new,
             temperature=temperature,
             top_p=top_p,
+            non_streaming_mode=True,
         )
         if voice_clone_prompt is not None:
             kwargs["voice_clone_prompt"] = voice_clone_prompt
@@ -188,15 +204,17 @@ class TtsBackend:
         top_p: float = 0.9,
         chunk_size: int = 8,
     ) -> Iterator[Tuple[np.ndarray, int]]:
-        max_new_tokens = _token_budget(text, max_new_tokens)
+        min_new, max_new_tokens = _speech_token_limits(text, max_new_tokens)
         kwargs = dict(
             text=text,
             language=language,
             speaker=speaker,
             instruct=instruct,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new,
             temperature=temperature,
             top_p=top_p,
+            non_streaming_mode=True,
         )
         if self.is_fast and hasattr(self.model, "generate_custom_voice_streaming"):
             stream_kwargs = dict(kwargs)
@@ -227,14 +245,16 @@ class TtsBackend:
         top_p: float = 0.9,
         chunk_size: int = 8,
     ) -> Iterator[Tuple[np.ndarray, int]]:
-        max_new_tokens = _token_budget(text, max_new_tokens)
+        min_new, max_new_tokens = _speech_token_limits(text, max_new_tokens)
         kwargs = dict(
             text=text,
             language=language,
             instruct=instruct,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new,
             temperature=temperature,
             top_p=top_p,
+            non_streaming_mode=True,
         )
         if self.is_fast and hasattr(self.model, "generate_voice_design_streaming"):
             stream_kwargs = dict(kwargs)

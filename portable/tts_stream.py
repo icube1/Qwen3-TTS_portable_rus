@@ -15,7 +15,7 @@ import soundfile as sf
 
 TEXT_CHUNK_CHARS = 500
 PREROLL_SEC = 10.0
-CHUNK_PAUSE_SEC = 0.15
+CHUNK_PAUSE_SEC = 0.06
 QUEUE_MAX = 16
 DEFAULT_SR = 24000
 
@@ -30,6 +30,20 @@ def _pcm1d(pcm: np.ndarray) -> np.ndarray:
     if x.ndim > 1:
         x = np.mean(x, axis=-1).astype(np.float32)
     return np.ascontiguousarray(x)
+
+
+def _trim_trailing_silence(pcm: np.ndarray, sr: int, floor: float = 0.012, keep_sec: float = 0.04) -> np.ndarray:
+    """Срезает хвост тишины у последнего куска чанка, не трогая саму речь."""
+    x = _pcm1d(pcm)
+    if x.size < 8:
+        return x
+    mag = np.abs(x)
+    voiced = np.flatnonzero(mag > floor)
+    if voiced.size == 0:
+        keep = int(keep_sec * sr)
+        return x[:keep] if keep < x.size else x
+    end = min(x.size, int(voiced[-1]) + int(keep_sec * sr) + 1)
+    return x[:end]
 
 
 def _live_dir(output_path: str) -> Path:
@@ -130,13 +144,25 @@ def stream_pcm_to_ui(
                 if not _put(("status", f"{title}\nЧасть {i + 1}/{total}: {text[:70]}...")):
                     break
                 got = False
+                pending = None
+                pending_sr = last_sr
                 for pcm, sr in generate_chunk(text):
                     if stop_fn():
                         break
-                    last_sr = sr
+                    piece = _pcm1d(pcm)
+                    piece_sr = int(sr)
+                    last_sr = piece_sr
+                    if pending is not None:
+                        if not _put(("pcm", i, pending_sr, pending)):
+                            pending = None
+                            break
+                    pending = piece
+                    pending_sr = piece_sr
                     got = True
-                    if not _put(("pcm", i, int(sr), _pcm1d(pcm))):
-                        break
+                if pending is not None:
+                    pending = _trim_trailing_silence(pending, pending_sr)
+                    if pending.size:
+                        _put(("pcm", i, pending_sr, pending))
                 if stop_fn():
                     break
                 if got and i < total - 1 and pause_sec > 0:
