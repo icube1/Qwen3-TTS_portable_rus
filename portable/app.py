@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from urllib.parse import urlparse
 import pickle
 import hashlib
 
@@ -28,20 +29,25 @@ import torch
 import soundfile as sf
 from huggingface_hub import snapshot_download, hf_hub_download
 
-# Добавляем родительскую директорию для импорта qwen_tts
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# portable/ — tts_engine, tts_stream; родитель — вендорный qwen_tts
+_PORTABLE_DIR = Path(__file__).resolve().parent
+_REPO_DIR = _PORTABLE_DIR.parent
+sys.path.insert(0, str(_PORTABLE_DIR))
+sys.path.insert(1, str(_REPO_DIR))
 
 from qwen_tts import Qwen3TTSModel, VoiceClonePromptItem
+from tts_engine import engine_status_line, get_tts_backend
+from tts_stream import TEXT_CHUNK_CHARS, live_stop_cmd, new_output_path, stream_pcm_to_ui
 
 # =====================================================
 # Константы и конфигурация
 # =====================================================
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 APP_NAME = "Qwen3-TTS Portable PRO"
 
 # Директории
-SCRIPT_DIR = Path(__file__).parent
+SCRIPT_DIR = _PORTABLE_DIR
 VOICES_DIR = SCRIPT_DIR / "voices"
 PROFILES_DIR = SCRIPT_DIR / "profiles"
 OUTPUT_DIR = SCRIPT_DIR / "output"
@@ -349,6 +355,308 @@ def download_cloud_voice(voice_name: str) -> str:
 # Вспомогательные функции
 # =====================================================
 
+_TLD = (
+    "com|org|net|edu|gov|io|ai|app|dev|me|tv|cc|co|info|biz|pro|xyz|online|"
+    "site|blog|news|media|club|shop|store|live|link|top|fun|space|tech|"
+    "ru|su|ua|by|kz|uz|am|ge|md|"
+    "uk|de|fr|it|es|nl|pl|cz|sk|hu|ro|bg|rs|hr|lt|lv|ee|fi|se|no|dk|"
+    "tr|il|in|cn|jp|kr|au|nz|br|mx|us|ca|ly|to|fm|gg|page"
+)
+_HOST = rf"(?:[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?\.)+(?:{_TLD})"
+_URL_TAIL = r"(?:[^\s<>\]\)\"']*)?"
+_MD_LINK_RE = re.compile(
+    rf"\[([^\]]+)\]\((https?://[^\s)]+|www\.[^\s)]+|{_HOST}(?:/[^\s)]*)?)\)",
+    re.IGNORECASE,
+)
+_BARE_URL_RE = re.compile(
+    rf"(?P<url>https?://[^\s<>\]\)\"']+|www\.[^\s<>\]\)\"']+|(?<![\w./@-]){_HOST}(?::\d{{2,5}})?(?:/{_URL_TAIL})?)",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(
+    rf"(?<![\w./-])[\w.+-]+@{_HOST}\b",
+    re.IGNORECASE,
+)
+_AT_HANDLE_RE = re.compile(r"(?<!\w)@([A-Za-z0-9_]{3,32})\b")
+
+
+def _host_from_url(url: str) -> str:
+    raw = url.strip().rstrip(".,;:!?)»\"'")
+    if not re.match(r"^https?://", raw, re.IGNORECASE):
+        raw = "http://" + raw
+    try:
+        host = (urlparse(raw).netloc or "").lower()
+    except Exception:
+        host = ""
+    if host.startswith("www."):
+        host = host[4:]
+    host = host.split(":")[0]
+    return host or "сайта"
+
+
+def speech_limits(model_size: str = "") -> Tuple[int, float]:
+    """1.7B быстрее сыпется: короче чанк и больше живой буфер."""
+    if "1.7" in str(model_size):
+        return 400, 12.0
+    return 550, 8.0
+
+
+_ONES_M = ("ноль", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять")
+_ONES_F = ("ноль", "одна", "две", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять")
+_TEENS = (
+    "десять", "одиннадцать", "двенадцать", "тринадцать", "четырнадцать",
+    "пятнадцать", "шестнадцать", "семнадцать", "восемнадцать", "девятнадцать",
+)
+_TENS = ("", "", "двадцать", "тридцать", "сорок", "пятьдесят", "шестьдесят", "семьдесят", "восемьдесят", "девяносто")
+_HUNDREDS = ("", "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот", "семьсот", "восемьсот", "девятьсот")
+_MONTHS_GEN = (
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+_ORD_NEUT = {
+    1: "первое", 2: "второе", 3: "третье", 4: "четвёртое", 5: "пятое",
+    6: "шестое", 7: "седьмое", 8: "восьмое", 9: "девятое", 10: "десятое",
+    11: "одиннадцатое", 12: "двенадцатое", 13: "тринадцатое", 14: "четырнадцатое",
+    15: "пятнадцатое", 16: "шестнадцатое", 17: "семнадцатое", 18: "восемнадцатое",
+    19: "девятнадцатое", 20: "двадцатое", 21: "двадцать первое", 22: "двадцать второе",
+    23: "двадцать третье", 24: "двадцать четвёртое", 25: "двадцать пятое",
+    26: "двадцать шестое", 27: "двадцать седьмое", 28: "двадцать восьмое",
+    29: "двадцать девятое", 30: "тридцатое", 31: "тридцать первое",
+}
+
+
+def _triad_ru(n: int, feminine: bool = False) -> str:
+    n = int(n)
+    if n <= 0:
+        return ""
+    ones = _ONES_F if feminine else _ONES_M
+    parts: List[str] = []
+    h, rem = divmod(n, 100)
+    if h:
+        parts.append(_HUNDREDS[h])
+    if 10 <= rem <= 19:
+        parts.append(_TEENS[rem - 10])
+        return " ".join(parts)
+    t, o = divmod(rem, 10)
+    if t:
+        parts.append(_TENS[t])
+    if o:
+        parts.append(ones[o])
+    return " ".join(parts)
+
+
+def _int_ru(n: int, feminine: bool = False) -> str:
+    n = int(n)
+    if n < 0:
+        return "минус " + _int_ru(-n, feminine)
+    if n == 0:
+        return "ноль"
+    if n >= 1_000_000_000:
+        return " ".join(_ONES_M[int(d)] if d.isdigit() else d for d in str(n))
+    parts: List[str] = []
+    millions, rest = divmod(n, 1_000_000)
+    thousands, rest = divmod(rest, 1000)
+    if millions:
+        word = _triad_ru(millions, False)
+        tail = "миллионов"
+        if millions % 10 == 1 and millions % 100 != 11:
+            tail = "миллион"
+        elif millions % 10 in (2, 3, 4) and millions % 100 not in (12, 13, 14):
+            tail = "миллиона"
+        parts.append(f"{word} {tail}")
+    if thousands:
+        word = _triad_ru(thousands, True)
+        tail = "тысяч"
+        if thousands % 10 == 1 and thousands % 100 != 11:
+            tail = "тысяча"
+        elif thousands % 10 in (2, 3, 4) and thousands % 100 not in (12, 13, 14):
+            tail = "тысячи"
+        parts.append(f"{word} {tail}")
+    if rest or not parts:
+        parts.append(_triad_ru(rest, feminine) or ("ноль" if not parts else ""))
+    return " ".join(x for x in parts if x)
+
+
+def _year_ru(year: int) -> str:
+    y = int(year)
+    if 2000 <= y <= 2099:
+        rem = y - 2000
+        if rem == 0:
+            return "две тысячи"
+        return "две тысячи " + _int_ru(rem)
+    if 1900 <= y <= 1999:
+        rem = y - 1900
+        if rem == 0:
+            return "тысяча девятьсот"
+        return "тысяча девятьсот " + _int_ru(rem)
+    return _int_ru(y)
+
+
+def _expand_numbers_for_speech(text: str) -> str:
+    """Даты и числа словами: иначе 1.7B спотыкается на 27.09.2026 и годах."""
+
+    def _date(m: re.Match) -> str:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000 if y < 50 else 1900
+        if not (1 <= d <= 31 and 1 <= mo <= 12 and 1800 <= y <= 2100):
+            return m.group(0)
+        day = _ORD_NEUT.get(d) or _int_ru(d)
+        return f"{day} {_MONTHS_GEN[mo]} {_year_ru(y)} года"
+
+    text = re.sub(r"\b(\d{1,2})[./](\d{1,2})[./](\d{2}|\d{4})\b", _date, text)
+
+    def _time(m: re.Match) -> str:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h > 23 or mi > 59:
+            return m.group(0)
+        return f"{_int_ru(h)} {_hours_word(h)} {_int_ru(mi, True)} {_minutes_word(mi)}"
+
+    text = re.sub(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", _time, text)
+
+    def _frac(m: re.Match) -> str:
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > 1000 or b > 1000 or b == 0:
+            return m.group(0)
+        return f"{_int_ru(a)} из {_int_ru(b)}"
+
+    text = re.sub(r"\b(\d{1,4})\s*/\s*(\d{1,4})\b", _frac, text)
+
+    def _pct(m: re.Match) -> str:
+        raw = m.group(1).replace(" ", "").replace(",", ".")
+        try:
+            num = float(raw)
+        except ValueError:
+            return m.group(0)
+        if num == int(num) and abs(num) < 1_000_000:
+            return f"{_int_ru(int(num))} процентов"
+        whole, frac = raw.split(".", 1)
+        return f"{_int_ru(int(whole or 0))} запятая {_int_ru(int(frac))} процентов"
+
+    text = re.sub(r"\b(\d[\d\s]*,?\d*)\s*%", _pct, text)
+
+    def _year_only(m: re.Match) -> str:
+        y = int(m.group(1))
+        if not (1900 <= y <= 2099):
+            return m.group(0)
+        tail = m.group(2) or ""
+        spoken = _year_ru(y)
+        if tail:
+            return f"{spoken} {tail.strip()}"
+        return spoken
+
+    text = re.sub(r"\b((?:19|20)\d{2})(\s*(?:год(?:а|у|ов)?|г\.))?", _year_only, text, flags=re.IGNORECASE)
+
+    def _dec(m: re.Match) -> str:
+        if m.group(0).endswith("B") or m.group(0).endswith("b"):
+            return m.group(0)
+        a, b = m.group(1), m.group(2)
+        if len(a) > 6 or len(b) > 4:
+            return m.group(0)
+        return f"{_int_ru(int(a))} запятая {_int_ru(int(b))}"
+
+    text = re.sub(r"\b(\d{1,6})[.,](\d{1,4})(?![Bb\d])", _dec, text)
+
+    def _plain(m: re.Match) -> str:
+        raw = m.group(0).replace(" ", "").replace("\u00a0", "")
+        if len(raw) > 7:
+            return " ".join(_ONES_M[int(ch)] for ch in raw if ch.isdigit())
+        return _int_ru(int(raw))
+
+    text = re.sub(r"\b\d[\d\s\u00a0]{0,10}\d\b|\b\d\b", _plain, text)
+    return text
+
+
+def _hours_word(h: int) -> str:
+    if 11 <= (h % 100) <= 14:
+        return "часов"
+    if h % 10 == 1:
+        return "час"
+    if h % 10 in (2, 3, 4):
+        return "часа"
+    return "часов"
+
+
+def _minutes_word(m: int) -> str:
+    if 11 <= (m % 100) <= 14:
+        return "минут"
+    if m % 10 == 1:
+        return "минута"
+    if m % 10 in (2, 3, 4):
+        return "минуты"
+    return "минут"
+
+
+def _spoken_link(url: str, label: Optional[str] = None) -> str:
+    host = _host_from_url(url)
+    if label:
+        label = re.sub(r"\s+", " ", label).strip()
+        if label and not _BARE_URL_RE.fullmatch(label):
+            return f"{label} (ссылка на {host})"
+    return f"ссылка на {host}"
+
+
+def sanitize_text_for_speech(text: str) -> str:
+    """Убирает сырые URL и @ники: иначе модель зачитывает слэши и начинает галлюцинировать."""
+    text = text.replace("\ufeff", "").replace("\u200b", "")
+    held: List[str] = []
+
+    def _hold(spoken: str) -> str:
+        held.append(spoken)
+        return f"\x00L{len(held) - 1}\x00"
+
+    text = _MD_LINK_RE.sub(lambda m: _hold(_spoken_link(m.group(2), m.group(1))), text)
+    text = _EMAIL_RE.sub(lambda _m: _hold("электронная почта"), text)
+    text = _BARE_URL_RE.sub(lambda m: _hold(_spoken_link(m.group("url"))), text)
+    text = _AT_HANDLE_RE.sub(lambda m: _hold(f"аккаунт {m.group(1)}"), text)
+    for i, spoken in enumerate(held):
+        text = text.replace(f"\x00L{i}\x00", spoken)
+    text = re.sub(r"\b(\d+)[.,](\d+)[Bb]\b", r"\1 пункт \2 би", text)
+    text = _expand_numbers_for_speech(text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def split_text_into_chunks(text: str, max_chars: int = 1500) -> List[str]:
+    """Разбивает длинный текст на части по границам предложений."""
+    text = sanitize_text_for_speech(text.strip())
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    # Разбиваем по концам предложений (. ! ? …)
+    sentences = re.split(r'(?<=[.!?…])\s+', text)
+
+    chunks = []
+    current = ""
+    for sentence in sentences:
+        # Если предложение само длиннее лимита — режем по запятым
+        if len(sentence) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            parts = re.split(r'(?<=[,;:])\s+', sentence)
+            sub = ""
+            for part in parts:
+                if len(sub) + len(part) + 1 <= max_chars:
+                    sub = (sub + " " + part).strip() if sub else part
+                else:
+                    if sub:
+                        chunks.append(sub)
+                    sub = part
+            if sub:
+                current = sub
+        elif len(current) + len(sentence) + 1 <= max_chars:
+            current = (current + " " + sentence).strip() if current else sentence
+        else:
+            if current:
+                chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
 def get_device():
     """Определение устройства для вычислений."""
     if torch.cuda.is_available():
@@ -361,36 +669,41 @@ def get_model_path(model_type: str, model_size: str) -> str:
     return snapshot_download(f"Qwen/Qwen3-TTS-12Hz-{model_size}-{model_type}")
 
 
+def get_backend(model_type: str, model_size: str):
+    """Бэкенд генерации: CUDA Graphs если есть, иначе официальный qwen_tts."""
+    return get_tts_backend(model_type, model_size, get_model_path(model_type, model_size))
+
+
 def get_model(model_type: str, model_size: str) -> Qwen3TTSModel:
-    """Получение или загрузка модели."""
-    global loaded_models
-    key = (model_type, model_size)
+    """Официальный wrapper модели (для профилей и prompt). Не грузим второй инстанс."""
+    return get_backend(model_type, model_size).inner
 
-    if key not in loaded_models:
-        model_path = get_model_path(model_type, model_size)
-        device = get_device()
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-        # Пробуем использовать Flash Attention, если доступен
-        attn_impl = None
-        if device == "cuda":
-            try:
-                import flash_attn
-                attn_impl = "flash_attention_2"
-                print(f"Flash Attention 2 активирован для {model_type} {model_size}")
-            except ImportError:
-                attn_impl = "sdpa"
-                print(f"Используется SDPA для {model_type} {model_size}")
+def resolve_language(language: str) -> str:
+    for code, name in LANGUAGES.items():
+        if name == language:
+            return code
+    return "Auto"
 
-        loaded_models[key] = Qwen3TTSModel.from_pretrained(
-            model_path,
-            device_map=device,
-            dtype=dtype,
-            attn_implementation=attn_impl,
-        )
-        print(f"Модель {model_type} {model_size} загружена успешно!")
 
-    return loaded_models[key]
+def resolve_speaker(speaker: str) -> str:
+    for sid, sname in SPEAKERS.items():
+        if sname == speaker:
+            return sid.lower()
+    if speaker:
+        return speaker.split()[0].lower()
+    return "vivian"
+
+
+def make_result_audio():
+    """Выходной плеер. Без Gradio streaming: в портативке нет ffmpeg, из-за него был WinError 2."""
+    return gr.Audio(
+        label="Результат",
+        type="filepath",
+        interactive=False,
+        autoplay=False,
+        format="wav",
+    )
 
 
 def normalize_audio(wav, eps=1e-12, clip=True):
@@ -506,71 +819,59 @@ def generate_voice_design(
     model_size: str,
     max_tokens: int,
     temperature: float,
-    top_p: float
+    top_p: float,
+    autoplay: bool = True,
 ) -> Iterator[Tuple[Optional[Tuple[int, np.ndarray]], str]]:
-    """Генерация речи с дизайном голоса (стриминг)."""
+    """Генерация речи с дизайном голоса (стриминг в плеер)."""
     global is_generating, stop_generation
 
     if not text or not text.strip():
-        yield None, "Ошибка: Введите текст для синтеза."
+        yield None, "Ошибка: Введите текст для синтеза.", ""
         return
 
     if not voice_description or not voice_description.strip():
-        yield None, "Ошибка: Введите описание голоса."
+        yield None, "Ошибка: Введите описание голоса.", ""
         return
 
-    # Только 1.7B поддерживает VoiceDesign
     if model_size != "1.7B":
-        yield None, "Ошибка: Дизайн голоса доступен только для модели 1.7B."
+        yield None, "Ошибка: Дизайн голоса доступен только для модели 1.7B.", ""
         return
 
     is_generating = True
     stop_generation = False
 
     try:
-        yield None, "Загрузка модели VoiceDesign..."
-        tts = get_model("VoiceDesign", model_size)
+        yield None, "Загрузка модели VoiceDesign...", ""
+        backend = get_backend("VoiceDesign", model_size)
+        lang_code = resolve_language(language)
+        chunk_chars, preroll = speech_limits(model_size)
+        chunks = split_text_into_chunks(text.strip(), max_chars=chunk_chars)
+        yield None, f"{engine_status_line()}\nТекст разбит на {len(chunks)} частей.", ""
 
-        yield None, f"Генерация речи...\nТекст: {text[:50]}...\nОписание: {voice_description[:50]}..."
+        def generate_chunk(chunk: str):
+            yield from backend.stream_design(
+                text=chunk,
+                language=lang_code,
+                instruct=voice_description.strip(),
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
 
-        # Получаем реальный код языка
-        lang_code = language.split()[0] if language != "Auto" else "Auto"
-        for code, name in LANGUAGES.items():
-            if name == language:
-                lang_code = code
-                break
-
-        start_time = time.time()
-
-        wavs, sr = tts.generate_voice_design(
-            text=text.strip(),
-            language=lang_code,
-            instruct=voice_description.strip(),
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
+        yield from stream_pcm_to_ui(
+            chunks,
+            generate_chunk,
+            output_path=new_output_path(OUTPUT_DIR),
+            autoplay=bool(autoplay),
+            stop_fn=lambda: stop_generation,
+            title="Дизайн голоса",
+            engine_name=backend.engine,
+            preroll_sec=preroll,
         )
-
-        if stop_generation:
-            is_generating = False
-            yield None, "Генерация остановлена пользователем."
-            return
-
-        generation_time = time.time() - start_time
-        audio_duration = len(wavs[0]) / sr
-
-        # Сохраняем файл
-        saved_path = save_audio_file(wavs[0], sr)
-
-        status = f"Генерация завершена!\n"
-        status += f"Время генерации: {generation_time:.2f} сек\n"
-        status += f"Длительность аудио: {audio_duration:.2f} сек\n"
-        status += f"Файл сохранен: {saved_path}"
-
-        yield (sr, wavs[0]), status
-
     except Exception as e:
-        yield None, f"Ошибка: {type(e).__name__}: {e}"
+        import traceback
+        traceback.print_exc()
+        yield None, f"Ошибка: {type(e).__name__}: {e}", ""
     finally:
         is_generating = False
 
@@ -584,73 +885,68 @@ def generate_voice_clone(
     model_size: str,
     max_tokens: int,
     temperature: float,
-    top_p: float
+    top_p: float,
+    autoplay: bool = True,
 ) -> Iterator[Tuple[Optional[Tuple[int, np.ndarray]], str]]:
-    """Клонирование голоса (стриминг)."""
+    """Клонирование голоса с нарезкой и стримом в плеер."""
     global is_generating, stop_generation
 
     if not target_text or not target_text.strip():
-        yield None, "Ошибка: Введите текст для синтеза."
+        yield None, "Ошибка: Введите текст для синтеза.", ""
         return
 
     audio_tuple = audio_to_tuple(ref_audio)
     if audio_tuple is None:
-        yield None, "Ошибка: Загрузите референсное аудио."
+        yield None, "Ошибка: Загрузите референсное аудио.", ""
         return
 
     if not use_xvector_only and (not ref_text or not ref_text.strip()):
-        yield None, "Ошибка: Введите текст референсного аудио или включите режим 'Только x-vector'."
+        yield None, "Ошибка: Введите текст референсного аудио или включите режим 'Только x-vector'.", ""
         return
 
     is_generating = True
     stop_generation = False
 
     try:
-        yield None, "Загрузка модели Base..."
-        tts = get_model("Base", model_size)
+        yield None, "Загрузка модели Base...", ""
+        backend = get_backend("Base", model_size)
+        lang_code = resolve_language(language)
+        chunk_chars, preroll = speech_limits(model_size)
+        chunks = split_text_into_chunks(target_text.strip(), max_chars=chunk_chars)
+        yield None, f"{engine_status_line()}\nСчитаю voice prompt один раз...", ""
 
-        yield None, f"Клонирование голоса...\nТекст: {target_text[:50]}..."
-
-        # Получаем реальный код языка
-        lang_code = "Auto"
-        for code, name in LANGUAGES.items():
-            if name == language:
-                lang_code = code
-                break
-
-        start_time = time.time()
-
-        wavs, sr = tts.generate_voice_clone(
-            text=target_text.strip(),
-            language=lang_code,
+        prompt = backend.create_voice_clone_prompt(
             ref_audio=audio_tuple,
             ref_text=ref_text.strip() if ref_text else None,
             x_vector_only_mode=use_xvector_only,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
         )
+        yield None, f"Текст разбит на {len(chunks)} частей. Начинаю генерацию...", ""
 
-        if stop_generation:
-            is_generating = False
-            yield None, "Генерация остановлена пользователем."
-            return
+        def generate_chunk(chunk: str):
+            yield from backend.stream_clone(
+                text=chunk,
+                language=lang_code,
+                voice_clone_prompt=prompt,
+                x_vector_only_mode=use_xvector_only,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
 
-        generation_time = time.time() - start_time
-        audio_duration = len(wavs[0]) / sr
-
-        # Сохраняем файл
-        saved_path = save_audio_file(wavs[0], sr)
-
-        status = f"Клонирование завершено!\n"
-        status += f"Время генерации: {generation_time:.2f} сек\n"
-        status += f"Длительность аудио: {audio_duration:.2f} сек\n"
-        status += f"Файл сохранен: {saved_path}"
-
-        yield (sr, wavs[0]), status
-
+        yield from stream_pcm_to_ui(
+            chunks,
+            generate_chunk,
+            output_path=new_output_path(OUTPUT_DIR),
+            autoplay=bool(autoplay),
+            stop_fn=lambda: stop_generation,
+            title="Клонирование голоса",
+            engine_name=backend.engine,
+            preroll_sec=preroll,
+        )
     except Exception as e:
-        yield None, f"Ошибка: {type(e).__name__}: {e}"
+        import traceback
+        traceback.print_exc()
+        yield None, f"Ошибка: {type(e).__name__}: {e}", ""
     finally:
         is_generating = False
 
@@ -662,74 +958,58 @@ def generate_with_profile(
     model_size: str,
     max_tokens: int,
     temperature: float,
-    top_p: float
+    top_p: float,
+    autoplay: bool = True,
 ) -> Iterator[Tuple[Optional[Tuple[int, np.ndarray]], str]]:
-    """Генерация с использованием сохранённого профиля голоса."""
+    """Генерация с сохранённым профилем голоса."""
     global is_generating, stop_generation
 
     if not target_text or not target_text.strip():
-        yield None, "Ошибка: Введите текст для синтеза."
+        yield None, "Ошибка: Введите текст для синтеза.", ""
         return
 
     if not profile_name:
-        yield None, "Ошибка: Выберите профиль голоса."
+        yield None, "Ошибка: Выберите профиль голоса.", ""
         return
 
     is_generating = True
     stop_generation = False
 
     try:
-        yield None, f"Загрузка профиля '{profile_name}'..."
+        yield None, f"Загрузка профиля '{profile_name}'...", ""
         voice_prompt, load_msg = load_voice_profile(profile_name)
-
         if voice_prompt is None:
-            yield None, load_msg
+            yield None, load_msg, ""
             return
 
-        yield None, "Загрузка модели Base..."
-        tts = get_model("Base", model_size)
+        yield None, "Загрузка модели Base...", ""
+        backend = get_backend("Base", model_size)
+        lang_code = resolve_language(language)
+        chunk_chars, preroll = speech_limits(model_size)
+        chunks = split_text_into_chunks(target_text.strip(), max_chars=chunk_chars)
 
-        yield None, f"Генерация с профилем '{profile_name}'...\nТекст: {target_text[:50]}..."
+        def generate_chunk(chunk: str):
+            yield from backend.stream_clone(
+                text=chunk,
+                language=lang_code,
+                voice_clone_prompt=voice_prompt,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
 
-        # Получаем реальный код языка
-        lang_code = "Auto"
-        for code, name in LANGUAGES.items():
-            if name == language:
-                lang_code = code
-                break
-
-        start_time = time.time()
-
-        wavs, sr = tts.generate_voice_clone(
-            text=target_text.strip(),
-            language=lang_code,
-            voice_clone_prompt=voice_prompt,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
+        yield from stream_pcm_to_ui(
+            chunks,
+            generate_chunk,
+            output_path=new_output_path(OUTPUT_DIR),
+            autoplay=bool(autoplay),
+            stop_fn=lambda: stop_generation,
+            title=f"Профиль {profile_name}",
+            engine_name=backend.engine,
+            preroll_sec=preroll,
         )
-
-        if stop_generation:
-            is_generating = False
-            yield None, "Генерация остановлена пользователем."
-            return
-
-        generation_time = time.time() - start_time
-        audio_duration = len(wavs[0]) / sr
-
-        # Сохраняем файл
-        saved_path = save_audio_file(wavs[0], sr)
-
-        status = f"Генерация завершена!\n"
-        status += f"Профиль: {profile_name}\n"
-        status += f"Время генерации: {generation_time:.2f} сек\n"
-        status += f"Длительность аудио: {audio_duration:.2f} сек\n"
-        status += f"Файл сохранен: {saved_path}"
-
-        yield (sr, wavs[0]), status
-
     except Exception as e:
-        yield None, f"Ошибка: {type(e).__name__}: {e}"
+        yield None, f"Ошибка: {type(e).__name__}: {e}", ""
     finally:
         is_generating = False
 
@@ -742,74 +1022,57 @@ def generate_custom_voice(
     model_size: str,
     max_tokens: int,
     temperature: float,
-    top_p: float
+    top_p: float,
+    autoplay: bool = True,
 ) -> Iterator[Tuple[Optional[Tuple[int, np.ndarray]], str]]:
-    """Генерация с пресетами голосов (стриминг)."""
+    """Пресеты голосов с нарезкой и стримом в плеер."""
     global is_generating, stop_generation
 
     if not text or not text.strip():
-        yield None, "Ошибка: Введите текст для синтеза."
+        yield None, "Ошибка: Введите текст для синтеза.", ""
         return
 
     if not speaker:
-        yield None, "Ошибка: Выберите голос."
+        yield None, "Ошибка: Выберите голос.", ""
         return
 
     is_generating = True
     stop_generation = False
 
     try:
-        yield None, "Загрузка модели CustomVoice..."
-        tts = get_model("CustomVoice", model_size)
+        yield None, "Загрузка модели CustomVoice...", ""
+        backend = get_backend("CustomVoice", model_size)
+        speaker_id = resolve_speaker(speaker)
+        lang_code = resolve_language(language)
+        chunk_chars, preroll = speech_limits(model_size)
+        chunks = split_text_into_chunks(text.strip(), max_chars=chunk_chars)
+        yield None, f"{engine_status_line()}\nТекст разбит на {len(chunks)} частей.", ""
 
-        # Получаем реальное имя спикера
-        speaker_id = speaker.split()[0] if speaker else "Vivian"
-        for sid, sname in SPEAKERS.items():
-            if sname == speaker:
-                speaker_id = sid
-                break
+        def generate_chunk(chunk: str):
+            yield from backend.stream_custom(
+                text=chunk,
+                language=lang_code,
+                speaker=speaker_id,
+                instruct=instruct.strip() if instruct else None,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
 
-        yield None, f"Генерация речи...\nТекст: {text[:50]}...\nГолос: {speaker}"
-
-        # Получаем реальный код языка
-        lang_code = "Auto"
-        for code, name in LANGUAGES.items():
-            if name == language:
-                lang_code = code
-                break
-
-        start_time = time.time()
-
-        wavs, sr = tts.generate_custom_voice(
-            text=text.strip(),
-            language=lang_code,
-            speaker=speaker_id.lower(),
-            instruct=instruct.strip() if instruct else None,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
+        yield from stream_pcm_to_ui(
+            chunks,
+            generate_chunk,
+            output_path=new_output_path(OUTPUT_DIR),
+            autoplay=bool(autoplay),
+            stop_fn=lambda: stop_generation,
+            title="Пресет голоса",
+            engine_name=backend.engine,
+            preroll_sec=preroll,
         )
-
-        if stop_generation:
-            is_generating = False
-            yield None, "Генерация остановлена пользователем."
-            return
-
-        generation_time = time.time() - start_time
-        audio_duration = len(wavs[0]) / sr
-
-        # Сохраняем файл
-        saved_path = save_audio_file(wavs[0], sr)
-
-        status = f"Генерация завершена!\n"
-        status += f"Время генерации: {generation_time:.2f} сек\n"
-        status += f"Длительность аудио: {audio_duration:.2f} сек\n"
-        status += f"Файл сохранен: {saved_path}"
-
-        yield (sr, wavs[0]), status
-
     except Exception as e:
-        yield None, f"Ошибка: {type(e).__name__}: {e}"
+        import traceback
+        traceback.print_exc()
+        yield None, f"Ошибка: {type(e).__name__}: {e}", ""
     finally:
         is_generating = False
 
@@ -823,128 +1086,95 @@ def generate_multi_speaker(
     model_size: str,
     max_tokens: int,
     temperature: float,
-    top_p: float
+    top_p: float,
+    autoplay: bool = True,
 ) -> Iterator[Tuple[Optional[Tuple[int, np.ndarray]], str]]:
-    """Генерация диалога с несколькими дикторами."""
+    """Диалог нескольких дикторов со стримом в плеер."""
     global is_generating, stop_generation
 
     if not script or not script.strip():
-        yield None, "Ошибка: Введите сценарий диалога."
+        yield None, "Ошибка: Введите сценарий диалога.", ""
         return
 
-    # Парсим скрипт
     parsed_lines = parse_multi_speaker_script(script)
     if not parsed_lines:
-        yield None, "Ошибка: Не удалось распознать формат сценария."
+        yield None, "Ошибка: Не удалось распознать формат сценария.", ""
         return
 
-    # Проверяем, что все дикторы имеют аудио
     used_speakers = set(sp for sp, _ in parsed_lines)
     for sp in used_speakers:
         if sp >= num_speakers:
-            yield None, f"Ошибка: В сценарии используется Диктор {sp}, но настроено только {num_speakers} дикторов."
+            yield None, f"Ошибка: В сценарии используется Диктор {sp}, но настроено только {num_speakers} дикторов.", ""
             return
         audio = speaker_audios[sp] if sp < len(speaker_audios) else None
         if audio_to_tuple(audio) is None:
-            yield None, f"Ошибка: Не загружено аудио для Диктора {sp}."
+            yield None, f"Ошибка: Не загружено аудио для Диктора {sp}.", ""
             return
 
     is_generating = True
     stop_generation = False
 
     try:
-        yield None, "Загрузка модели Base..."
-        tts = get_model("Base", model_size)
+        yield None, "Загрузка модели Base...", ""
+        backend = get_backend("Base", model_size)
+        lang_code = resolve_language(language)
 
-        # Получаем реальный код языка
-        lang_code = "Auto"
-        for code, name in LANGUAGES.items():
-            if name == language:
-                lang_code = code
-                break
-
-        # Создаём voice prompts для каждого диктора
-        yield None, "Создание профилей голосов для дикторов..."
+        yield None, "Создание профилей голосов для дикторов...", ""
         voice_prompts = {}
         for sp in used_speakers:
             audio_tuple = audio_to_tuple(speaker_audios[sp])
             ref_text = speaker_texts[sp] if sp < len(speaker_texts) else None
-
-            voice_prompts[sp] = tts.create_voice_clone_prompt(
+            voice_prompts[sp] = backend.create_voice_clone_prompt(
                 ref_audio=audio_tuple,
                 ref_text=ref_text.strip() if ref_text else None,
-                x_vector_only_mode=not bool(ref_text)
+                x_vector_only_mode=not bool(ref_text),
             )
 
-        # Генерируем аудио для каждой реплики
-        all_audio_chunks = []
-        total_lines = len(parsed_lines)
-        sample_rate = None
+        line_texts = [sanitize_text_for_speech(text) for _, text in parsed_lines]
+        prompt_by_index = [voice_prompts[sp] for sp, _ in parsed_lines]
 
-        start_time = time.time()
-
-        for i, (speaker_id, text) in enumerate(parsed_lines):
-            if stop_generation:
-                is_generating = False
-                yield None, "Генерация остановлена пользователем."
-                return
-
-            yield None, f"Генерация реплики {i+1}/{total_lines}...\nДиктор {speaker_id}: {text[:30]}..."
-
-            wavs, sr = tts.generate_voice_clone(
-                text=text,
+        def generate_chunk(chunk: str):
+            idx = generate_chunk.i
+            generate_chunk.i += 1
+            yield from backend.stream_clone(
+                text=chunk,
                 language=lang_code,
-                voice_clone_prompt=voice_prompts[speaker_id],
+                voice_clone_prompt=prompt_by_index[idx],
                 max_new_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )
 
-            if sample_rate is None:
-                sample_rate = sr
+        generate_chunk.i = 0
 
-            all_audio_chunks.append(wavs[0])
-
-            # Добавляем паузу между репликами
-            pause_samples = int(0.3 * sr)  # 300ms пауза
-            all_audio_chunks.append(np.zeros(pause_samples, dtype=np.float32))
-
-        if stop_generation:
-            is_generating = False
-            yield None, "Генерация остановлена пользователем."
-            return
-
-        # Объединяем все аудио
-        final_audio = np.concatenate(all_audio_chunks)
-
-        generation_time = time.time() - start_time
-        audio_duration = len(final_audio) / sample_rate
-
-        # Сохраняем файл
-        saved_path = save_audio_file(final_audio, sample_rate)
-
-        status = f"Multi-speaker генерация завершена!\n"
-        status += f"Дикторов: {len(used_speakers)}\n"
-        status += f"Реплик: {total_lines}\n"
-        status += f"Время генерации: {generation_time:.2f} сек\n"
-        status += f"Длительность аудио: {audio_duration:.2f} сек\n"
-        status += f"Файл сохранен: {saved_path}"
-
-        yield (sample_rate, final_audio), status
-
+        yield from stream_pcm_to_ui(
+            line_texts,
+            generate_chunk,
+            output_path=new_output_path(OUTPUT_DIR),
+            autoplay=bool(autoplay),
+            stop_fn=lambda: stop_generation,
+            title="Multi-speaker",
+            engine_name=backend.engine,
+            pause_sec=0.3,
+            preroll_sec=speech_limits(model_size)[1],
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
-        yield None, f"Ошибка: {type(e).__name__}: {e}"
+        yield None, f"Ошибка: {type(e).__name__}: {e}", ""
     finally:
         is_generating = False
 
 
 def stop_generation_fn():
-    """Остановка генерации."""
+    """Полный стоп: рвём GPU-поток и гасим живой плеер."""
     global stop_generation
     stop_generation = True
-    return "Остановка генерации..."
+    return (
+        gr.update(value=None, autoplay=False),
+        "Остановлено. Генерация и воспроизведение прерваны.",
+        live_stop_cmd(int(time.time() * 1000)),
+    )
 
 
 # =====================================================
@@ -1058,6 +1288,16 @@ def build_ui():
     .prose {
         color: #e2e8f0 !important;
     }
+
+    /* Куски живого эфира должны оставаться в DOM: visible=False у Gradio часто без textarea. */
+    #tts_live_chunk {
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+    }
     """
 
     theme = gr.themes.Soft(
@@ -1066,18 +1306,90 @@ def build_ui():
         secondary_hue="purple",
     )
 
-    # Темная тема по умолчанию
-    js = """
-    () => {
-        const url = new URL(window.location);
-        if (url.searchParams.get('__theme') !== 'dark') {
-            url.searchParams.set('__theme', 'dark');
-            window.location.href = url.href;
+    # Gradio 6: js/css/theme только в launch(). head — обычный <script>, иначе () => {} не вызывается.
+    head_html = """
+    <script>
+    (function () {
+        if (window.__ttsInit) return;
+        window.__ttsInit = true;
+        window.__tts = { ctx: null, next: 0, sources: [], last: '', paused: false };
+        const AC = window.AudioContext || window.webkitAudioContext;
+        function queueBuf(buf) {
+            const t = window.__tts;
+            const src = t.ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(t.ctx.destination);
+            const now = t.ctx.currentTime;
+            if (t.next < now + 0.03) t.next = now + 0.03;
+            src.start(t.next);
+            t.next += buf.duration;
+            t.sources.push(src);
+            src.onended = () => { t.sources = t.sources.filter((x) => x !== src); };
         }
-    }
+        window.ttsArm = () => {
+            const t = window.__tts;
+            if (!t.ctx || t.ctx.state === 'closed') {
+                t.ctx = new AC();
+                t.next = 0;
+                t.sources = [];
+            }
+            if (!t.paused) t.ctx.resume();
+        };
+        window.ttsTogglePause = () => {
+            const t = window.__tts;
+            if (!t.ctx) return;
+            if (t.ctx.state === 'running') {
+                t.paused = true;
+                t.ctx.suspend();
+            } else {
+                t.paused = false;
+                t.ctx.resume();
+            }
+        };
+        window.ttsStop = () => {
+            const t = window.__tts;
+            (t.sources || []).forEach((s) => { try { s.stop(); } catch (e) {} });
+            t.sources = [];
+            t.next = 0;
+            t.paused = false;
+            if (t.ctx && t.ctx.state !== 'closed') {
+                try { t.ctx.suspend(); } catch (e) {}
+            }
+        };
+        window.ttsPushFile = async (name) => {
+            if (!name) return;
+            window.ttsArm();
+            const res = await fetch('/tts_live/' + encodeURIComponent(name));
+            if (!res.ok) { console.warn('[tts] live fetch', res.status, name); return; }
+            const arr = await res.arrayBuffer();
+            const buf = await window.__tts.ctx.decodeAudioData(arr.slice(0));
+            queueBuf(buf);
+        };
+        window.ttsHandle = (payload) => {
+            if (!payload) return;
+            let msg = payload;
+            try { msg = JSON.parse(payload); } catch (e) { return; }
+            if (msg.cmd === 'stop') { window.ttsStop(); return; }
+            if (msg.cmd === 'push' && msg.file) window.ttsPushFile(msg.file);
+        };
+        const watchLive = () => {
+            const root = document.getElementById('tts_live_chunk');
+            if (!root) return;
+            const el = root.querySelector('textarea') || root.querySelector('input') || root;
+            if (!el) return;
+            const v = (el.value !== undefined && el.value !== '') ? el.value : (el.textContent || '');
+            if (v && v !== window.__tts.last) {
+                window.__tts.last = v;
+                window.ttsHandle(v);
+            }
+        };
+        setInterval(watchLive, 120);
+        console.log('[tts] live player ready');
+    })();
+    </script>
     """
 
-    with gr.Blocks(theme=theme, css=css, title=APP_NAME, js=js) as demo:
+    with gr.Blocks(title=APP_NAME) as demo:
         # Заголовок
         gr.HTML(f"""
         <div class="main-header">
@@ -1097,8 +1409,100 @@ def build_ui():
             autoplay_checkbox = gr.Checkbox(
                 label="Автовоспроизведение",
                 value=True,
-                info="Автоматически проигрывать готовое аудио"
+                info="Живой эфир через Web Audio: без заиканий на стыке кусков. Выкл — только файл.",
             )
+        live_chunk = gr.Textbox(
+            label="live",
+            visible=True,
+            show_label=False,
+            lines=1,
+            max_lines=1,
+            elem_id="tts_live_chunk",
+        )
+        # Gradio 6 гарантированно исполняет js= на клике. head/Blocks js могут молчать.
+        TTS_ARM_JS = r"""
+(...args) => {
+    if (!window.__ttsInit) {
+        window.__ttsInit = true;
+        window.__tts = { ctx: null, next: 0, sources: [], last: '', paused: false };
+        const AC = window.AudioContext || window.webkitAudioContext;
+        function queueBuf(buf) {
+            const t = window.__tts;
+            const src = t.ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(t.ctx.destination);
+            const now = t.ctx.currentTime;
+            if (t.next < now + 0.03) t.next = now + 0.03;
+            src.start(t.next);
+            t.next += buf.duration;
+            t.sources.push(src);
+            src.onended = () => { t.sources = t.sources.filter((x) => x !== src); };
+        }
+        window.ttsArm = () => {
+            const t = window.__tts;
+            if (!t.ctx || t.ctx.state === 'closed') {
+                t.ctx = new AC();
+                t.next = 0;
+                t.sources = [];
+            }
+            if (!t.paused) t.ctx.resume();
+        };
+        window.ttsTogglePause = () => {
+            const t = window.__tts;
+            if (!t.ctx) return;
+            if (t.ctx.state === 'running') {
+                t.paused = true;
+                t.ctx.suspend();
+            } else {
+                t.paused = false;
+                t.ctx.resume();
+            }
+        };
+        window.ttsStop = () => {
+            const t = window.__tts;
+            (t.sources || []).forEach((s) => { try { s.stop(); } catch (e) {} });
+            t.sources = [];
+            t.next = 0;
+            t.paused = false;
+            if (t.ctx && t.ctx.state !== 'closed') {
+                try { t.ctx.suspend(); } catch (e) {}
+            }
+        };
+        window.ttsPushFile = async (name) => {
+            if (!name) return;
+            window.ttsArm();
+            const res = await fetch('/tts_live/' + encodeURIComponent(name));
+            if (!res.ok) { console.warn('[tts] live fetch', res.status, name); return; }
+            const arr = await res.arrayBuffer();
+            const buf = await window.__tts.ctx.decodeAudioData(arr.slice(0));
+            queueBuf(buf);
+        };
+        window.ttsHandle = (payload) => {
+            if (!payload) return;
+            let msg = payload;
+            try { msg = JSON.parse(payload); } catch (e) { return; }
+            if (msg.cmd === 'stop') { window.ttsStop(); return; }
+            if (msg.cmd === 'push' && msg.file) window.ttsPushFile(msg.file);
+        };
+        const watchLive = () => {
+            const root = document.getElementById('tts_live_chunk');
+            if (!root) return;
+            const el = root.querySelector('textarea') || root.querySelector('input') || root;
+            if (!el) return;
+            const v = (el.value !== undefined && el.value !== '') ? el.value : (el.textContent || '');
+            if (v && v !== window.__tts.last) {
+                window.__tts.last = v;
+                window.ttsHandle(v);
+            }
+        };
+        setInterval(watchLive, 120);
+        console.log('[tts] live player armed');
+    }
+    if (window.ttsArm) window.ttsArm();
+    return args;
+}
+"""
+        TTS_PAUSE_JS = "(...args) => { if (window.ttsTogglePause) window.ttsTogglePause(); return args; }"
 
         with gr.Tabs() as tabs:
             # =====================================================
@@ -1151,7 +1555,7 @@ def build_ui():
                             )
                             cv_temperature = gr.Slider(
                                 label="Температура",
-                                minimum=0.1, maximum=2.0, value=0.7, step=0.1
+                                minimum=0.1, maximum=2.0, value=0.45, step=0.1
                             )
                             cv_top_p = gr.Slider(
                                 label="Top-P",
@@ -1160,15 +1564,11 @@ def build_ui():
 
                         with gr.Row():
                             cv_generate_btn = gr.Button("Сгенерировать", variant="primary", scale=2)
+                            cv_pause_btn = gr.Button("Пауза / далее", scale=1)
                             cv_stop_btn = gr.Button("Стоп", variant="stop", scale=1)
 
                     with gr.Column(scale=1, elem_classes="generation-card"):
-                        cv_audio_out = gr.Audio(
-                            label="Результат",
-                            type="numpy",
-                            interactive=False,
-                            autoplay=True,
-                        )
+                        cv_audio_out = make_result_audio()
                         cv_status = gr.Textbox(
                             label="Статус",
                             lines=4,
@@ -1192,12 +1592,18 @@ def build_ui():
                             label=""
                         )
 
-                cv_generate_btn.click(
+                cv_gen_evt = cv_generate_btn.click(
                     generate_custom_voice,
-                    inputs=[cv_text, cv_language, cv_speaker, cv_instruct, cv_model_size, cv_max_tokens, cv_temperature, cv_top_p],
-                    outputs=[cv_audio_out, cv_status],
+                    inputs=[cv_text, cv_language, cv_speaker, cv_instruct, cv_model_size, cv_max_tokens, cv_temperature, cv_top_p, autoplay_checkbox],
+                    outputs=[cv_audio_out, cv_status, live_chunk],
+                    js=TTS_ARM_JS,
                 )
-                cv_stop_btn.click(stop_generation_fn, outputs=[cv_status])
+                cv_pause_btn.click(fn=None, js=TTS_PAUSE_JS)
+                cv_stop_btn.click(
+                    stop_generation_fn,
+                    outputs=[cv_audio_out, cv_status, live_chunk],
+                    cancels=[cv_gen_evt],
+                )
 
             # =====================================================
             # Вкладка 2: Клонирование голоса (Base)
@@ -1299,7 +1705,7 @@ def build_ui():
                             )
                             vc_temperature = gr.Slider(
                                 label="Температура",
-                                minimum=0.1, maximum=2.0, value=0.7, step=0.1
+                                minimum=0.1, maximum=2.0, value=0.45, step=0.1
                             )
                             vc_top_p = gr.Slider(
                                 label="Top-P",
@@ -1308,15 +1714,11 @@ def build_ui():
 
                         with gr.Row():
                             vc_generate_btn = gr.Button("Клонировать и озвучить", variant="primary", scale=2)
+                            vc_pause_btn = gr.Button("Пауза / далее", scale=1)
                             vc_stop_btn = gr.Button("Стоп", variant="stop", scale=1)
 
                     with gr.Column(scale=1, elem_classes="generation-card"):
-                        vc_audio_out = gr.Audio(
-                            label="Результат",
-                            type="numpy",
-                            interactive=False,
-                            autoplay=True,
-                        )
+                        vc_audio_out = make_result_audio()
                         vc_status = gr.Textbox(
                             label="Статус",
                             lines=4,
@@ -1373,12 +1775,18 @@ def build_ui():
                                 outputs=[vc_download_status],
                             )
 
-                vc_generate_btn.click(
+                vc_gen_evt = vc_generate_btn.click(
                     generate_voice_clone,
-                    inputs=[vc_ref_audio, vc_ref_text, vc_target_text, vc_language, vc_xvector_only, vc_model_size, vc_max_tokens, vc_temperature, vc_top_p],
-                    outputs=[vc_audio_out, vc_status],
+                    inputs=[vc_ref_audio, vc_ref_text, vc_target_text, vc_language, vc_xvector_only, vc_model_size, vc_max_tokens, vc_temperature, vc_top_p, autoplay_checkbox],
+                    outputs=[vc_audio_out, vc_status, live_chunk],
+                    js=TTS_ARM_JS,
                 )
-                vc_stop_btn.click(stop_generation_fn, outputs=[vc_status])
+                vc_pause_btn.click(fn=None, js=TTS_PAUSE_JS)
+                vc_stop_btn.click(
+                    stop_generation_fn,
+                    outputs=[vc_audio_out, vc_status, live_chunk],
+                    cancels=[vc_gen_evt],
+                )
 
             # =====================================================
             # Вкладка 3: Multi-speaker
@@ -1504,7 +1912,7 @@ def build_ui():
                             )
                             ms_temperature = gr.Slider(
                                 label="Температура",
-                                minimum=0.1, maximum=2.0, value=0.7, step=0.1
+                                minimum=0.1, maximum=2.0, value=0.45, step=0.1
                             )
                             ms_top_p = gr.Slider(
                                 label="Top-P",
@@ -1521,14 +1929,10 @@ def build_ui():
 
                         with gr.Row():
                             ms_generate_btn = gr.Button("Сгенерировать диалог", variant="primary", scale=2)
+                            ms_pause_btn = gr.Button("Пауза / далее", scale=1)
                             ms_stop_btn = gr.Button("Стоп", variant="stop", scale=1)
 
-                        ms_audio_out = gr.Audio(
-                            label="Результат",
-                            type="numpy",
-                            interactive=False,
-                            autoplay=True,
-                        )
+                        ms_audio_out = make_result_audio()
                         ms_status = gr.Textbox(
                             label="Статус",
                             lines=6,
@@ -1536,20 +1940,26 @@ def build_ui():
                         )
 
                 # Wrapper для передачи аудио дикторов
-                def multi_speaker_wrapper(script, num_speakers, audio0, audio1, audio2, audio3, text0, text1, text2, text3, language, model_size, max_tokens, temperature, top_p):
+                def multi_speaker_wrapper(script, num_speakers, audio0, audio1, audio2, audio3, text0, text1, text2, text3, language, model_size, max_tokens, temperature, top_p, autoplay):
                     audios = [audio0, audio1, audio2, audio3]
                     texts = [text0, text1, text2, text3]
-                    yield from generate_multi_speaker(script, num_speakers, audios, texts, language, model_size, max_tokens, temperature, top_p)
+                    yield from generate_multi_speaker(script, num_speakers, audios, texts, language, model_size, max_tokens, temperature, top_p, autoplay)
 
-                ms_generate_btn.click(
+                ms_gen_evt = ms_generate_btn.click(
                     multi_speaker_wrapper,
                     inputs=[ms_script, ms_num_speakers,
                             speaker_audios[0], speaker_audios[1], speaker_audios[2], speaker_audios[3],
                             speaker_texts[0], speaker_texts[1], speaker_texts[2], speaker_texts[3],
-                            ms_language, ms_model_size, ms_max_tokens, ms_temperature, ms_top_p],
-                    outputs=[ms_audio_out, ms_status],
+                            ms_language, ms_model_size, ms_max_tokens, ms_temperature, ms_top_p, autoplay_checkbox],
+                    outputs=[ms_audio_out, ms_status, live_chunk],
+                    js=TTS_ARM_JS,
                 )
-                ms_stop_btn.click(stop_generation_fn, outputs=[ms_status])
+                ms_pause_btn.click(fn=None, js=TTS_PAUSE_JS)
+                ms_stop_btn.click(
+                    stop_generation_fn,
+                    outputs=[ms_audio_out, ms_status, live_chunk],
+                    cancels=[ms_gen_evt],
+                )
 
             # =====================================================
             # Вкладка 4: Дизайн голоса (VoiceDesign)
@@ -1596,7 +2006,7 @@ def build_ui():
                             )
                             vd_temperature = gr.Slider(
                                 label="Температура",
-                                minimum=0.1, maximum=2.0, value=0.7, step=0.1
+                                minimum=0.1, maximum=2.0, value=0.45, step=0.1
                             )
                             vd_top_p = gr.Slider(
                                 label="Top-P",
@@ -1605,15 +2015,11 @@ def build_ui():
 
                         with gr.Row():
                             vd_generate_btn = gr.Button("Сгенерировать", variant="primary", scale=2)
+                            vd_pause_btn = gr.Button("Пауза / далее", scale=1)
                             vd_stop_btn = gr.Button("Стоп", variant="stop", scale=1)
 
                     with gr.Column(scale=1, elem_classes="generation-card"):
-                        vd_audio_out = gr.Audio(
-                            label="Результат",
-                            type="numpy",
-                            interactive=False,
-                            autoplay=True,
-                        )
+                        vd_audio_out = make_result_audio()
                         vd_status = gr.Textbox(
                             label="Статус",
                             lines=4,
@@ -1641,14 +2047,23 @@ def build_ui():
                             label=""
                         )
 
-                vd_generate_btn.click(
+                vd_gen_evt = vd_generate_btn.click(
                     generate_voice_design,
-                    inputs=[vd_text, vd_language, vd_description, vd_model_size, vd_max_tokens, vd_temperature, vd_top_p],
-                    outputs=[vd_audio_out, vd_status],
+                    inputs=[vd_text, vd_language, vd_description, vd_model_size, vd_max_tokens, vd_temperature, vd_top_p, autoplay_checkbox],
+                    outputs=[vd_audio_out, vd_status, live_chunk],
+                    js=TTS_ARM_JS,
                 )
-                vd_stop_btn.click(stop_generation_fn, outputs=[vd_status])
+                vd_pause_btn.click(fn=None, js=TTS_PAUSE_JS)
+                vd_stop_btn.click(
+                    stop_generation_fn,
+                    outputs=[vd_audio_out, vd_status, live_chunk],
+                    cancels=[vd_gen_evt],
+                )
 
 
+    demo._portable_theme = theme
+    demo._portable_css = css
+    demo._portable_head = head_html
     return demo
 
 
@@ -1677,6 +2092,7 @@ if __name__ == "__main__":
 
     local_voices = get_local_voices()
     print(f"Локальных голосов: {len(local_voices)}")
+    print(engine_status_line())
 
     profiles = list_voice_profiles()
     print(f"Сохранённых профилей: {len(profiles)}")
@@ -1687,10 +2103,40 @@ if __name__ == "__main__":
 
     # Строим и запускаем интерфейс
     demo = build_ui()
+
+    from fastapi.responses import FileResponse, Response
+    from gradio.routes import App as GradioApp
+
+    _create_app = GradioApp.create_app
+
+    def _create_app_with_live(*args, **kwargs):
+        app = _create_app(*args, **kwargs)
+        if getattr(app, "_tts_live_ok", False):
+            return app
+        app._tts_live_ok = True
+        live_root = (OUTPUT_DIR / "live").resolve()
+
+        @app.get("/tts_live/{name}")
+        async def tts_live(name: str):
+            if not name.endswith(".wav") or any(ch in name for ch in ("/", "\\", "..")):
+                return Response(status_code=400)
+            path = (live_root / name).resolve()
+            if path.parent != live_root or not path.is_file():
+                return Response(status_code=404)
+            return FileResponse(str(path), media_type="audio/wav")
+
+        return app
+
+    GradioApp.create_app = staticmethod(_create_app_with_live)
+
     demo.queue(default_concurrency_limit=4).launch(
         server_name="127.0.0.1",
         server_port=7860,
         share=False,
         show_error=True,
         inbrowser=True,
+        theme=demo._portable_theme,
+        css=demo._portable_css,
+        head=demo._portable_head,
+        allowed_paths=[str(OUTPUT_DIR.resolve())],
     )

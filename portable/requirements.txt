@@ -1,6 +1,9 @@
 # Qwen3-TTS Portable - Зависимости
 # PyTorch устанавливается отдельно через install.bat
 
+# CUDA Graphs-ускоритель (ставится без зависимостей, чтобы не снести transformers)
+faster-qwen3-tts
+
 # Основные зависимости Qwen3-TTS
 transformers==4.57.3
 accelerate==1.12.0

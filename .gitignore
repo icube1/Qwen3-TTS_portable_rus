@@ -22,3 +22,17 @@ wheels/
 .vscode/
 venv/
 env/
+
+# Portable runtime — не заливать модели, Python и вывод
+portable/python/
+portable/models/
+portable/output/
+portable/output/live/
+portable/sox/
+portable/temp/
+portable/cache/
+portable/downloads/
+portable/__pycache__/
+portable/cuda_version.txt
+*.safetensors
+*.bin

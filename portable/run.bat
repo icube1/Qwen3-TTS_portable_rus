@@ -50,9 +50,11 @@ if not exist "%TEMP%" mkdir "%TEMP%"
 REM Hugging Face кэш и модели в локальной папке
 set "HF_HOME=%SCRIPT_DIR%models"
 set "HUGGINGFACE_HUB_CACHE=%SCRIPT_DIR%models"
-set "TRANSFORMERS_CACHE=%SCRIPT_DIR%models"
 set "HF_DATASETS_CACHE=%SCRIPT_DIR%models\datasets"
 if not exist "%HF_HOME%" mkdir "%HF_HOME%"
+
+REM Чтобы app.py видел tts_engine.py / tts_stream.py и вендорный qwen_tts
+set "PYTHONPATH=%SCRIPT_DIR%;%SCRIPT_DIR%..;%PYTHONPATH%"
 
 REM Torch кэш
 set "TORCH_HOME=%SCRIPT_DIR%models\torch"
@@ -73,6 +75,7 @@ if not exist "%VOICES_DIR%" mkdir "%VOICES_DIR%"
 REM =====================================================
 REM Переменные окружения для Python
 REM =====================================================
+set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
 
